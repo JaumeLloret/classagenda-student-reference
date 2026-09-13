@@ -23,7 +23,7 @@ Este snapshot **no es una arquitectura recomendada para AulaFlow y no debe copia
 - El `pom.xml` declara Java 21, Maven, JUnit y el controlador JDBC de SQL Server.
 - El código utiliza `HttpServer` y JDBC. No se incluyen la base de datos, sus datos ni configuración de conexión.
 - Se conservan cuatro clases de tests que no necesitan base de datos. Su presencia no acredita por sí sola que hayan pasado ni que el sistema completo funcione.
-- El ejemplo de CI está adaptado para activación manual. Su existencia no acredita una ejecución de CI.
+- CI se activa por `push` exclusivamente en `work/student-reference-2026-27`, para validar el SHA recibido con Java 21. Se conserva `workflow_dispatch` para uso posterior, limitado al mismo repositorio y rama; no se utiliza en la validación 1G-quater. La configuración por sí sola no acredita una ejecución ni un resultado: las evidencias corresponden al run concreto.
 
 La selección conserva las fuentes de producción y los archivos Maven para permitir comprobaciones técnicas por parte del mantenimiento. No se entrega un despliegue completo: faltan deliberadamente infraestructura, esquema y configuración de base de datos. **Ejecutar o compilar no forma parte del encargo PI1.**
 
