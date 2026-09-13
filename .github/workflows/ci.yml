@@ -1,0 +1,28 @@
+name: Snapshot checks (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-backend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Make mvnw executable
+        run: chmod +x backend/mvnw
+
+      - name: Run test (backend)
+        working-directory: backend
+        run: ./mvnw -q test
