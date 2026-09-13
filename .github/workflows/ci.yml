@@ -1,0 +1,202 @@
+name: Snapshot checks (Java 21)
+
+on:
+  push:
+    branches:
+      - work/student-reference-2026-27
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-backend:
+    if: >-
+      github.repository == 'JaumeLloret/classagenda-student-reference' &&
+      github.ref == 'refs/heads/work/student-reference-2026-27' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Initialize evidence
+        run: mkdir -p "$RUNNER_TEMP/classagenda-ci"
+
+      - name: Checkout event SHA
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout identity
+        id: identity
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          data = {k: os.environ['GITHUB_' + k.upper()] for k in
+                  ('repository', 'ref', 'sha', 'event_name', 'run_id', 'run_attempt')}
+          data.update(checkout_sha=git('rev-parse', 'HEAD'), tree_sha=git('rev-parse', 'HEAD^{tree}'))
+          data['tracked_clean_before'] = not git('status', '--porcelain', '--untracked-files=no')
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'classagenda-ci/identity.json'
+          path.write_text(json.dumps(data, indent=2) + '\n')
+          print(json.dumps(data, indent=2))
+          assert data['repository'] == 'JaumeLloret/classagenda-student-reference'
+          assert data['ref'] == 'refs/heads/work/student-reference-2026-27'
+          assert data['checkout_sha'] == data['sha']
+          assert data['tracked_clean_before']
+          PY
+
+      - name: Set up Java 21
+        id: java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Record and verify tool versions
+        id: tools
+        timeout-minutes: 3
+        working-directory: backend
+        run: |
+          set -o pipefail
+          java -version 2>&1 | tee "$RUNNER_TEMP/classagenda-ci/java.log"
+          javac -version 2>&1 | tee "$RUNNER_TEMP/classagenda-ci/javac.log"
+          sh ./mvnw -B -ntp -version 2>&1 | tee "$RUNNER_TEMP/classagenda-ci/maven-version.log"
+          python3 - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'classagenda-ci'
+          assert re.search(r'version "21(?:\.|\")', (root / 'java.log').read_text())
+          assert re.search(r'javac 21(?:\.|\s|$)', (root / 'javac.log').read_text())
+          assert 'Apache Maven 3.9.11' in (root / 'maven-version.log').read_text()
+          PY
+
+      - name: Compile and run all selected unit tests
+        id: maven
+        timeout-minutes: 10
+        working-directory: backend
+        run: |
+          set -o pipefail
+          set +e
+          sh ./mvnw -B -ntp -DfailIfNoTests=true test 2>&1 | tee "$RUNNER_TEMP/classagenda-ci/maven.log"
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          printf '%s\n' "${codes[0]}" > "$RUNNER_TEMP/classagenda-ci/maven-exit-code.txt"
+          test "${codes[1]}" -eq 0
+          exit "${codes[0]}"
+
+      - name: Collect reports and classify result
+        id: evidence
+        if: always()
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          IDENTITY_OUTCOME: ${{ steps.identity.outcome }}
+          JAVA_OUTCOME: ${{ steps.java.outcome }}
+          TOOLS_OUTCOME: ${{ steps.tools.outcome }}
+          MAVEN_OUTCOME: ${{ steps.maven.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, subprocess, xml.etree.ElementTree as ET
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'classagenda-ci'
+          root.mkdir(parents=True, exist_ok=True)
+          def read(name):
+              path = root / name
+              return path.read_text(errors='replace') if path.exists() else ''
+          identity = json.loads(read('identity.json') or '{}')
+          event = {k: os.environ['GITHUB_' + k.upper()] for k in
+                   ('repository', 'ref', 'sha', 'event_name', 'run_id', 'run_attempt')}
+          outcomes = {k: os.environ[k.upper() + '_OUTCOME'] for k in
+                      ('checkout', 'identity', 'java', 'tools', 'maven')}
+          expected = {
+              'com.classagendaprofessor.features.task.domain.model.TaskTest': 3,
+              'com.classagendaprofessor.shared.config.ServerConfigTest': 3,
+              'com.classagendaprofessor.shared.http.ResponseContractTest': 2,
+              'com.classagendaprofessor.shared.http.handlers.HealthHandlerTest': 1,
+          }
+          reports, parse_errors = [], []
+          source = pathlib.Path('backend/target/surefire-reports')
+          destination = root / 'surefire'
+          destination.mkdir(exist_ok=True)
+          for pattern in ('TEST-*.xml', '*.txt'):
+              for path in sorted(source.glob(pattern)):
+                  shutil.copyfile(path, destination / path.name)
+          for path in sorted(destination.glob('TEST-*.xml')):
+              try:
+                  suite = ET.parse(path).getroot()
+                  cases = suite.findall('testcase')
+                  counts = {k: int(suite.get(k, '0')) for k in ('tests', 'failures', 'errors', 'skipped')}
+                  observed = dict(tests=len(cases), failures=sum(c.find('failure') is not None for c in cases),
+                                  errors=sum(c.find('error') is not None for c in cases),
+                                  skipped=sum(c.find('skipped') is not None for c in cases))
+                  reports.append(dict(file=path.name, name=suite.get('name'), counts=counts,
+                                      testcase_counts=observed, counts_consistent=counts == observed,
+                                      testcases=[dict(classname=c.get('classname'), name=c.get('name')) for c in cases]))
+              except (ET.ParseError, ValueError) as exc:
+                  parse_errors.append(dict(file=path.name, error=str(exc)))
+          totals = {k: sum(r['counts'][k] for r in reports) for k in ('tests', 'failures', 'errors', 'skipped')}
+          expected_reports = (len(reports) == 4 and {r['name']: r['counts']['tests'] for r in reports} == expected)
+          consistent = bool(reports) and all(r['counts_consistent'] and
+              all(c['classname'] == r['name'] for c in r['testcases']) for r in reports)
+          tracked = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True)
+          clean = outcomes['checkout'] == 'success' and tracked.returncode == 0 and not tracked.stdout.strip()
+          (root / 'tracked-files.json').write_text(json.dumps(dict(clean=clean,
+              command_exit_code=tracked.returncode, changed=tracked.stdout.splitlines()), indent=2) + '\n')
+          version_logs = {k: read(v) for k, v in dict(java='java.log', javac='javac.log', maven='maven-version.log').items()}
+          maven_log = read('maven.log')
+          maven_rc = int(read('maven-exit-code.txt').strip()) if read('maven-exit-code.txt').strip() else None
+          dependencies = bool(re.search(r'Could not (?:resolve|transfer|find)|Failed to (?:read artifact|collect dependencies)|DependencyResolutionException|PluginResolutionException|cannot download|failed to download',
+              maven_log + version_logs['maven'], re.I))
+          prep_ok = all(outcomes[k] == 'success' for k in ('checkout', 'identity', 'java', 'tools'))
+          technical_pass = (prep_ok and outcomes['maven'] == 'success' and maven_rc == 0 and clean and
+              identity.get('checkout_sha') == event['sha'] and expected_reports and consistent and not parse_errors and
+              totals == dict(tests=9, failures=0, errors=0, skipped=0))
+          if technical_pass:
+              phase = 'EXECUTION_CORRECT'
+          elif not prep_ok:
+              phase = 'DEPENDENCY_FAILURE' if dependencies and outcomes['java'] == 'success' else 'PREPARATION_FAILURE'
+          elif dependencies:
+              phase = 'DEPENDENCY_FAILURE'
+          elif re.search(r'COMPILATION ERROR|Compilation failure|maven-compiler-plugin[^\n]*failed', maven_log, re.I):
+              phase = 'COMPILATION_FAILURE'
+          elif not clean:
+              phase = 'PREPARATION_FAILURE'
+          elif reports or outcomes['maven'] == 'success' or re.search(r'No tests|maven-surefire-plugin[^\n]*failed', maven_log, re.I):
+              phase = 'TEST_FAILURE'
+          else:
+              phase = 'UNCLASSIFIED_FAILURE'
+          compilation = 'PASS' if reports or technical_pass else ('FAILED' if phase == 'COMPILATION_FAILURE' else 'NOT_PROVEN')
+          files = [dict(path=str(p.relative_to(root)), bytes=p.stat().st_size,
+                        sha256=hashlib.sha256(p.read_bytes()).hexdigest()) for p in sorted(root.rglob('*')) if p.is_file()]
+          summary = dict(schema_version=1, event=event, identity=identity, outcomes=outcomes,
+              versions=version_logs, classification=phase, technical_pass=technical_pass,
+              compilation=compilation, maven_exit_code=maven_rc, expected_classes=expected,
+              reports=reports, totals=totals, expected_reports=expected_reports,
+              reports_consistent=consistent, parse_errors=parse_errors, tracked_files_unchanged=clean,
+              evidence_files=files, external_sql_integration='NOT_EXECUTED')
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Preserve private run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: classagenda-java21-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/classagenda-ci/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Require technical PASS from real reports
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'classagenda-ci/summary.json'
+          summary = json.loads(path.read_text()) if path.exists() else {}
+          sys.exit(0 if summary.get('technical_pass') is True else 1)
+          PY
